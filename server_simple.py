@@ -19,6 +19,11 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """多线程 HTTP 服务器，避免 API 调用阻塞其他请求"""
+    daemon_threads = True
 from pathlib import Path
 from typing import List, Optional
 import tempfile
@@ -28,7 +33,7 @@ import shutil
 # 配置（修改这里或设置环境变量）
 # ============================================================
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-b604361c737846e9a97c36cdd469aaa1")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", LLM_BASE_URL)
@@ -226,9 +231,15 @@ class RAGHandler(BaseHTTPRequestHandler):
 
     def _handle_upload(self, body):
         try:
-            form = urllib.parse.parse_qs(body.decode("utf-8"))
-            content = form.get("content", [""])[0]
-            filename = form.get("filename", ["upload.txt"])[0]
+            # 支持 JSON 格式
+            try:
+                data = json.loads(body)
+                content = data.get("content", "")
+                filename = data.get("filename", "upload.txt")
+            except json.JSONDecodeError:
+                form = urllib.parse.parse_qs(body.decode("utf-8"))
+                content = form.get("content", [""])[0]
+                filename = form.get("filename", ["upload.txt"])[0]
 
             if not content.strip():
                 self._resp(400, {"error": "文件内容为空"})
@@ -249,10 +260,20 @@ class RAGHandler(BaseHTTPRequestHandler):
                 self._resp(200, {"ok": True, "chunks": count,
                                  "msg": f"已添加 {count} 个文本块（模拟向量，请配置 API Key 启用真实检索）"})
             else:
-                vectors = embed_texts(chunks)
-                count = add_chunks_to_db(chunks, vectors, filename)
-                self._resp(200, {"ok": True, "chunks": count,
-                                 "msg": f"已添加 {count} 个文本块"})
+                try:
+                    vectors = embed_texts(chunks)
+                    count = add_chunks_to_db(chunks, vectors, filename)
+                    self._resp(200, {"ok": True, "chunks": count,
+                                     "msg": f"已添加 {count} 个文本块（真实向量）"})
+                except Exception as e:
+                    # Embedding API 调用失败，降级为模拟向量
+                    import random
+                    random.seed(42)
+                    dim = 10
+                    vectors = [[random.random() for _ in range(dim)] for _ in chunks]
+                    count = add_chunks_to_db(chunks, vectors, filename)
+                    self._resp(200, {"ok": True, "chunks": count,
+                                     "msg": f"已添加 {count} 个文本块（向量化 API 异常，使用模拟向量：{str(e)[:50]}）"})
 
         except Exception as e:
             self._resp(500, {"error": str(e)})
@@ -269,20 +290,23 @@ class RAGHandler(BaseHTTPRequestHandler):
                 self._resp(200, {"answer": "知识库为空，请先上传文档。", "sources": []})
                 return
 
-            # 如果没有真实向量（模拟数据），做简单关键词匹配
-            if not EMBEDDING_API_KEY or EMBEDDING_API_KEY == "sk-your-api-key-here":
-                # 简单关键词检索
-                results = self._keyword_search(query, db, top_k=3)
-                context = "\n\n".join(f"【参考{i+1}】{r['content']}" for i, r in enumerate(results))
-                sources = list(set(r["source"] for r in results))
-                answer = f"（模拟模式：已检索到 {len(results)} 个相关片段，请配置 API Key 获取 AI 回答）\n\n参考内容：\n{context[:500]}..."
+            # 第一步：关键词检索（中文友好，无需 Embedding API）
+            results = self._keyword_search(query, db, top_k=5)
+            if not results:
+                self._resp(200, {"answer": "知识库中没有找到相关信息，请上传包含相关内容的文档后再试。", "sources": []})
+                return
+            sources = list(set(r["source"] for r in results))
+            context = "\n\n".join(f"【参考{i+1}】{r['content']}" for i, r in enumerate(results))
+
+            # 第二步：有 LLM API Key 则调用大模型生成回答
+            if LLM_API_KEY:
+                try:
+                    answer = ask_llm(query, context)
+                    answer += f"\n\n---\n参考来源：{'、'.join(sources)}"
+                except Exception as e:
+                    answer = f"（大模型调用失败：{str(e)[:80]}）\n\n关键词匹配到 {len(results)} 个相关片段：\n{context[:500]}..."
             else:
-                query_vec = embed_texts([query])[0]
-                results = search_db(query_vec, top_k=5)
-                context = "\n\n".join(f"【参考{i+1}】（来源：{r['source']}）\n{r['content']}" for i, r in enumerate(results))
-                sources = list(set(r["source"] for r in results))
-                answer = ask_llm(query, context)
-                answer += f"\n\n---\n参考来源：{'、'.join(sources)}"
+                answer = f"（未配置 LLM API Key）\n\n关键词匹配到 {len(results)} 个相关片段：\n{context[:500]}..."
 
             self._resp(200, {"answer": answer, "sources": sources})
 
@@ -290,12 +314,18 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._resp(500, {"error": str(e)})
 
     def _keyword_search(self, query, db, top_k=3):
-        """简单关键词检索（无 API 时使用）"""
-        words = set(query.lower().replace("？","").replace("，","").split())
+        """简单关键词检索（无 API 时使用），按字符匹配"""
+        # 提取查询中连续的有意义片段（2字以上作为关键词）
+        q_chars = list(query)
+        keywords = set()
+        for i in range(len(q_chars) - 1):
+            keywords.add("".join(q_chars[i:i+2]))  # 2-gram
+        for i in range(len(q_chars) - 2):
+            keywords.add("".join(q_chars[i:i+3]))  # 3-gram
         scored = []
         for item in db["chunks"]:
-            content_lower = item["content"].lower()
-            score = sum(1 for w in words if w in content_lower)
+            content = item["content"]
+            score = sum(1 for kw in keywords if kw in content)
             if score > 0:
                 scored.append((score, item))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -424,21 +454,30 @@ function showMsg(text, type) {
 async function handleFile(e) {
   const file = e.target.files[0];
   if (!file) return;
-  const text = await file.text();
-  await uploadContent(text, file.name);
+  try {
+    const text = await file.text();
+    await uploadContent(text, file.name);
+  } catch(err) {
+    showMsg('文件读取失败: ' + err.message, 'err');
+    console.error(err);
+  }
 }
 
 async function handlePaste() {
-  const text = document.getElementById('paste-area').value;
-  const name = document.getElementById('filename-input').value || '粘贴文档.txt';
+  var text = document.getElementById('paste-area').value;
+  var name = document.getElementById('filename-input').value || '粘贴文档.txt';
   if (!text.trim()) { showMsg('请先粘贴内容', 'err'); return; }
-  await uploadContent(text, name);
+  try {
+    await uploadContent(text, name);
+  } catch(err) {
+    showMsg('上传失败: ' + err.message, 'err');
+    console.error(err);
+  }
 }
 
 async function uploadContent(content, filename) {
-  const params = new URLSearchParams({ content, filename });
-  const d = await apiForm('/api/upload', params);
-  if (d.error) showMsg(d.error, 'err');
+  var d = await api('/api/upload', 'POST', { content: content, filename: filename });
+  if (d.error) { showMsg(d.error, 'err'); console.error(d.error); }
   else { showMsg(d.msg, 'ok'); document.getElementById('paste-area').value = ''; await refreshStatus(); }
 }
 
@@ -453,7 +492,7 @@ function addMessage(text, isUser) {
   const box = document.getElementById('chat-box');
   const div = document.createElement('div');
   div.className = 'msg ' + (isUser ? 'msg-user' : 'msg-ai');
-  div.innerHTML = '<div class="msg-bubble">' + text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>') + '</div>';
+  div.innerHTML = '<div class="msg-bubble">' + text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').split('\\n').join('<br>') + '</div>';
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
   return div;
@@ -481,6 +520,7 @@ async function sendQuery() {
     }
   } catch(e) {
     loading.style.display = 'none';
+    console.error(e);
     addMessage('请求失败：' + e.message, false);
   }
 }
@@ -493,7 +533,7 @@ refreshStatus();
 
 def main():
     PORT = 8080
-    server = HTTPServer(("0.0.0.0", PORT), RAGHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), RAGHandler)
     print(f"\n{'='*50}")
     print(f"  RAG 知识库问答系统启动")
     print(f"  浏览器打开: http://localhost:{PORT}")
